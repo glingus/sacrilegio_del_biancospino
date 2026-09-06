@@ -8,14 +8,15 @@ Exports search results and summary statistics to an Excel file with pandas and o
 
 import csv
 import re
+import sys
 import time
 import random
 import argparse
 import logging
 import urllib.parse
+from pathlib import Path
 from dataclasses import dataclass
 from datetime import datetime
-from typing import List, Dict, Tuple, Set
 
 import pandas as pd
 
@@ -38,8 +39,10 @@ logger = logging.getLogger("paginebianche_scraper")
 MAX_PAGES_DEFAULT = 20
 PHONE_REGEX = re.compile(r'^(?:\+?39)?(?:0\d{5,10}|3\d{8,9})$')
 
-# Session flag for cookie acceptance
-COOKIES_ACCEPTED = False
+
+class BotBlockedException(Exception):
+    """Exception raised when an anti-bot challenge or WAF block is detected."""
+    pass
 
 
 @dataclass
@@ -49,7 +52,7 @@ class Contatto:
     telefono: str
     comune_ricerca: str
 
-    def get_dedup_key(self) -> Tuple[str, str, str]:
+    def get_dedup_key(self) -> tuple[str, str, str]:
         """
         Returns a normalized tuple (nome, indirizzo, telefono) used for deduplication.
         """
@@ -59,7 +62,7 @@ class Contatto:
         return (norm_nome, norm_indirizzo, norm_telefono)
 
 
-def setup_logging(verbose: bool = False):
+def setup_logging(verbose: bool = False) -> None:
     """
     Configures application-wide logging with DEBUG or INFO levels.
     """
@@ -71,7 +74,7 @@ def setup_logging(verbose: bool = False):
     )
 
 
-def random_delay(min_sec: float = 1.5, max_sec: float = 3.5):
+def random_delay(min_sec: float = 1.5, max_sec: float = 3.5) -> None:
     """
     Introduces a random sleep delay to simulate human browsing behavior.
     """
@@ -88,13 +91,14 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--nome", type=str, help="Nome e cognome da cercare (es. 'Mario Rossi')")
     parser.add_argument("--comuni", type=str, help="Lista dei comuni separati da virgola (es. 'Suzzara, Mantova')")
     parser.add_argument("--output", type=str, help="Nome del file di output (opzionale)")
+    parser.add_argument("--output-dir", type=str, default=".", help="Directory di destinazione per file Excel e checkpoint")
     parser.add_argument("--max-pages", type=int, default=MAX_PAGES_DEFAULT, help="Numero massimo di pagine per comune (default: 20)")
     parser.add_argument("--no-headless", action="store_true", help="Esegui il browser in modalità visibile (non headless)")
     parser.add_argument("--verbose", action="store_true", help="Abilita log dettagliati (DEBUG)")
     return parser.parse_args()
 
 
-def get_user_inputs(args: argparse.Namespace) -> Tuple[str, List[str]]:
+def get_user_inputs(args: argparse.Namespace) -> tuple[str, list[str]]:
     """
     Retrieves inputs from argparse options or falls back to interactive CLI prompts.
     """
@@ -142,16 +146,30 @@ def setup_driver(headless: bool = True) -> webdriver.Chrome:
 
     service = ChromeService(ChromeDriverManager().install())
     driver = webdriver.Chrome(service=service, options=options)
+    driver.cookies_accepted = False  # Attach cookie acceptance state to driver instance
     return driver
+
+
+def check_for_bot_block(driver: webdriver.Chrome) -> None:
+    """
+    Checks if an anti-bot challenge, captcha, or WAF block page is presented.
+    Raises BotBlockedException if a block is detected.
+    """
+    title = driver.title.lower()
+    page_source = driver.page_source.lower()
+
+    block_indicators = ["captcha", "challenge", "verifica la tua identità", "access denied", "robot"]
+    if any(ind in title for ind in block_indicators) or "awswafintegration" in page_source:
+        logger.critical(f"Rilevato blocco anti-bot / WAF / Captcha (Titolo pagina: '{driver.title}'). Interruzione run.")
+        raise BotBlockedException(f"Blocco anti-bot rilevato: {driver.title}")
 
 
 def accept_cookies(driver: webdriver.Chrome, timeout: int = 3) -> bool:
     """
     Detects and clicks the cookie acceptance banner button if present using a single combined XPath.
-    Uses a session flag to avoid re-checking after success.
+    Uses driver attribute state to avoid re-checking after success.
     """
-    global COOKIES_ACCEPTED
-    if COOKIES_ACCEPTED:
+    if getattr(driver, 'cookies_accepted', False):
         return True
 
     combined_xpath = (
@@ -167,7 +185,7 @@ def accept_cookies(driver: webdriver.Chrome, timeout: int = 3) -> bool:
         btn = wait.until(EC.element_to_be_clickable((By.XPATH, combined_xpath)))
         driver.execute_script("arguments[0].click();", btn)
         logger.info("[+] Banner cookie accettato.")
-        COOKIES_ACCEPTED = True
+        driver.cookies_accepted = True
         random_delay(1.0, 2.0)
         return True
     except TimeoutException:
@@ -177,10 +195,10 @@ def accept_cookies(driver: webdriver.Chrome, timeout: int = 3) -> bool:
     return False
 
 
-def search_municipality(driver: webdriver.Chrome, name: str, comune: str):
+def search_municipality(driver: webdriver.Chrome, name: str, comune: str) -> None:
     """
     Navigates to Pagine Bianche search page for the given name and municipality
-    and waits for results container.
+    and waits for results container or no-results element.
     """
     encoded_name = urllib.parse.quote(name)
     encoded_comune = urllib.parse.quote(comune)
@@ -189,18 +207,21 @@ def search_municipality(driver: webdriver.Chrome, name: str, comune: str):
     logger.info(f"Ricerca per '{name}' a '{comune}' -> {url}")
     driver.get(url)
 
+    check_for_bot_block(driver)
     accept_cookies(driver)
 
-    results_container_xpath = (
+    results_or_no_results_xpath = (
         "//div[contains(@class, 'search-item') or "
         "contains(@class, 'item-listing') or "
         "contains(@class, 'search-itm') or "
         "contains(@class, 'no-results') or "
-        "contains(@class, 'no-result')]"
+        "contains(@class, 'no-result') or "
+        "//*[contains(text(), 'Nessun risultato')] or "
+        "//*[contains(text(), 'non ha prodotto risultati')]]"
     )
     try:
         WebDriverWait(driver, 10).until(
-            EC.presence_of_element_located((By.XPATH, results_container_xpath))
+            EC.presence_of_element_located((By.XPATH, results_or_no_results_xpath))
         )
     except TimeoutException:
         logger.error("Timeout in attesa del caricamento dei risultati della ricerca.")
@@ -212,9 +233,6 @@ def validate_and_clean_phone(raw_phone: str) -> str:
     Returns cleaned string or empty string if invalid.
     """
     if not raw_phone:
-        return ""
-
-    if any(word in raw_phone.lower() for word in ['via', 'viale', 'piazza', 'corso', 'largo', 'strada', 'cap', 'milano', 'roma']):
         return ""
 
     candidates = re.findall(r'(\+?\d[\d\s\-\.\/]{5,}\d)', raw_phone)
@@ -230,17 +248,12 @@ def validate_and_clean_phone(raw_phone: str) -> str:
     return ""
 
 
-def extract_card_data(driver: webdriver.Chrome, card_index: int, specific_selector: str) -> Dict[str, str]:
+def extract_card_data(driver: webdriver.Chrome, card_element, comune_ricerca: str) -> Contatto | None:
     """
-    Extracts Name, Address, and Phone from a single result card re-queried by index.
-    Clicks 'Mostra numero' if present, re-fetching elements to avoid StaleElementReferenceException.
+    Extracts Name, Address, and Phone from a single card WebElement and returns Contatto or None.
+    Uses href='tel:' as primary phone source, and waits via WebDriverWait after 'Mostra numero'.
     """
-    cards = driver.find_elements(By.XPATH, specific_selector)
-    if card_index >= len(cards):
-        return {"Nome": "", "Indirizzo": "", "Telefono": ""}
-
-    card = cards[card_index]
-
+    # Name extraction
     nome = ""
     nome_selectors = [
         ".//h2",
@@ -251,7 +264,7 @@ def extract_card_data(driver: webdriver.Chrome, card_index: int, specific_select
     ]
     for sel in nome_selectors:
         try:
-            elem = card.find_element(By.XPATH, sel)
+            elem = card_element.find_element(By.XPATH, sel)
             text = elem.text.strip()
             if text:
                 nome = text
@@ -259,39 +272,61 @@ def extract_card_data(driver: webdriver.Chrome, card_index: int, specific_select
         except NoSuchElementException:
             continue
 
-    try:
-        phone_buttons = card.find_elements(
-            By.XPATH,
-            ".//button[contains(text(), 'Mostra') or contains(text(), 'numero') or contains(@class, 'phone')]"
-            " | .//a[contains(text(), 'Mostra') or contains(text(), 'numero') or contains(@class, 'phone')]"
-        )
-        for btn in phone_buttons:
-            if btn.is_displayed():
-                driver.execute_script("arguments[0].click();", btn)
-                time.sleep(0.5)
-                cards = driver.find_elements(By.XPATH, specific_selector)
-                if card_index < len(cards):
-                    card = cards[card_index]
-                break
-    except Exception as e:
-        logger.debug(f"Pulsante mostra numero non cliccabile o non presente: {e}")
+    if not nome:
+        return None
 
+    # Primary Phone extraction via href='tel:'
     telefono = ""
-    phone_selectors = [
-        ".//*[contains(@class, 'phone') or contains(@class, 'tel')]",
-        ".//a[contains(@href, 'tel:')]"
-    ]
-    for sel in phone_selectors:
-        try:
-            elem = card.find_element(By.XPATH, sel)
-            raw_text = elem.text.strip() or elem.get_attribute("href") or ""
-            cleaned_phone = validate_and_clean_phone(raw_text)
-            if cleaned_phone:
-                telefono = cleaned_phone
+    try:
+        tel_links = card_element.find_elements(By.XPATH, ".//a[contains(@href, 'tel:')]")
+        for link in tel_links:
+            href_val = link.get_attribute("href") or ""
+            cleaned = validate_and_clean_phone(href_val)
+            if cleaned:
+                telefono = cleaned
                 break
-        except NoSuchElementException:
-            continue
+    except Exception:
+        pass
 
+    # If phone not found in href, try clicking "Mostra numero" if present
+    if not telefono:
+        try:
+            phone_buttons = card_element.find_elements(
+                By.XPATH,
+                ".//button[contains(text(), 'Mostra') or contains(text(), 'numero') or contains(@class, 'phone')]"
+                " | .//a[contains(text(), 'Mostra') or contains(text(), 'numero') or contains(@class, 'phone')]"
+            )
+            for btn in phone_buttons:
+                if btn.is_displayed():
+                    driver.execute_script("arguments[0].click();", btn)
+                    # WebDriverWait for phone element to appear after click
+                    try:
+                        WebDriverWait(driver, 3).until(
+                            lambda d: card_element.find_elements(By.XPATH, ".//a[contains(@href, 'tel:')] | .//*[contains(@class, 'phone') or contains(@class, 'tel')]")
+                        )
+                    except TimeoutException:
+                        pass
+                    break
+        except Exception as e:
+            logger.debug(f"Pulsante mostra numero non presente o non cliccabile: {e}")
+
+        # Secondary Phone extraction from card text / tel elements
+        phone_selectors = [
+            ".//a[contains(@href, 'tel:')]",
+            ".//*[contains(@class, 'phone') or contains(@class, 'tel')]"
+        ]
+        for sel in phone_selectors:
+            try:
+                elem = card_element.find_element(By.XPATH, sel)
+                raw_text = elem.text.strip() or elem.get_attribute("href") or ""
+                cleaned_phone = validate_and_clean_phone(raw_text)
+                if cleaned_phone:
+                    telefono = cleaned_phone
+                    break
+            except NoSuchElementException:
+                continue
+
+    # Address extraction
     indirizzo = ""
     address_selectors = [
         ".//*[contains(@class, 'address')]",
@@ -301,7 +336,7 @@ def extract_card_data(driver: webdriver.Chrome, card_index: int, specific_select
     ]
     for sel in address_selectors:
         try:
-            elem = card.find_element(By.XPATH, sel)
+            elem = card_element.find_element(By.XPATH, sel)
             text = elem.text.strip()
             if text:
                 indirizzo = text
@@ -309,53 +344,64 @@ def extract_card_data(driver: webdriver.Chrome, card_index: int, specific_select
         except NoSuchElementException:
             continue
 
-    if not indirizzo or not nome:
+    if not indirizzo:
         try:
-            card_text = card.text.strip().split("\n")
-            if card_text:
-                if not nome and len(card_text) > 0:
-                    nome = card_text[0]
-                if not indirizzo and len(card_text) > 1:
-                    for line in card_text[1:]:
-                        if any(kw in line.lower() for kw in ['via', 'viale', 'piazza', 'corso', 'largo', 'strada']) or re.search(r'\b\d{5}\b', line):
-                            indirizzo = line.strip()
-                            break
+            card_text = card_element.text.strip().split("\n")
+            if len(card_text) > 1:
+                for line in card_text[1:]:
+                    if any(kw in line.lower() for kw in ['via', 'viale', 'piazza', 'corso', 'largo', 'strada']) or re.search(r'\b\d{5}\b', line):
+                        indirizzo = line.strip()
+                        break
         except StaleElementReferenceException:
-            logger.debug("Stale element intercettato durante il parsing testuale di fallback.")
+            logger.debug("Stale element durante parsing del testo di fallback.")
 
-    return {
-        "Nome": nome,
-        "Indirizzo": indirizzo,
-        "Telefono": telefono
-    }
+    return Contatto(
+        nome=nome,
+        indirizzo=indirizzo,
+        telefono=telefono,
+        comune_ricerca=comune_ricerca
+    )
 
 
-def save_checkpoint_csv(comune: str, contatti: List[Contatto]):
+def append_checkpoint_csv(checkpoint_filepath: Path, contatti: list[Contatto]) -> None:
     """
-    Saves a CSV checkpoint file for the specified municipality.
+    Appends a list of Contatto objects to a CSV checkpoint file.
+    Creates header if file does not exist.
     """
-    sanitized_comune = re.sub(r'[^a-zA-Z0-9]', '_', comune.strip().lower())
-    checkpoint_file = f"checkpoint_{sanitized_comune}.csv"
+    if not contatti:
+        return
+    file_exists = checkpoint_filepath.exists()
     try:
-        with open(checkpoint_file, mode="w", encoding="utf-8", newline="") as f:
+        with open(checkpoint_filepath, mode="a", encoding="utf-8", newline="") as f:
             writer = csv.writer(f)
-            writer.writerow(["Nome", "Indirizzo", "Telefono", "Comune di Ricerca"])
+            if not file_exists:
+                writer.writerow(["Nome", "Indirizzo", "Telefono", "Comune di Ricerca"])
             for c in contatti:
                 writer.writerow([c.nome, c.indirizzo, c.telefono, c.comune_ricerca])
-        logger.info(f"Checkpoint salvato per {comune}: '{checkpoint_file}' ({len(contatti)} record).")
+        logger.info(f"Appesi {len(contatti)} record al file di checkpoint '{checkpoint_filepath.name}'.")
     except Exception as e:
-        logger.error(f"Errore durante il salvataggio del checkpoint CSV per {comune}: {e}", exc_info=True)
+        logger.error(f"Errore durante la scrittura del checkpoint CSV '{checkpoint_filepath}': {e}", exc_info=True)
 
 
-def scrape_results_for_municipality(driver: webdriver.Chrome, comune_ricerca: str, max_pages: int = MAX_PAGES_DEFAULT) -> List[Contatto]:
+def scrape_results_for_municipality(
+    driver: webdriver.Chrome,
+    target_name: str,
+    comune_ricerca: str,
+    output_dir: Path,
+    run_timestamp: str,
+    max_pages: int = MAX_PAGES_DEFAULT
+) -> list[Contatto]:
     """
     Scrapes all pages of search results for a single municipality.
-    Returns list of Contatto objects.
+    Appends checkpoint CSV per page.
+    Distinguishes no-results (INFO) from broken layout (ERROR).
     """
-    contatti = []
+    sanitized_name = re.sub(r'[^a-zA-Z0-9]', '_', target_name.strip().lower())
+    sanitized_comune = re.sub(r'[^a-zA-Z0-9]', '_', comune_ricerca.strip().lower())
+    checkpoint_file = output_dir / f"checkpoint_{sanitized_name}_{sanitized_comune}_{run_timestamp}.csv"
+
+    contatti: list[Contatto] = []
     page_num = 1
-    previous_url = driver.current_url
-    previous_first_card_text = ""
 
     specific_card_selectors = [
         "//div[contains(@class, 'search-item')]",
@@ -363,49 +409,57 @@ def scrape_results_for_municipality(driver: webdriver.Chrome, comune_ricerca: st
         "//div[contains(@class, 'search-itm')]"
     ]
 
+    no_results_xpath = (
+        "//div[contains(@class, 'no-results') or contains(@class, 'no-result')] | "
+        "//*[contains(text(), 'Nessun risultato')] | "
+        "//*[contains(text(), 'non ha prodotto risultati')]"
+    )
+
     while page_num <= max_pages:
         logger.info(f"Estrazione pagina {page_num}/{max_pages} per comune: {comune_ricerca}...")
         random_delay(1.0, 2.0)
+        check_for_bot_block(driver)
+
+        # Check explicit no-results elements first
+        no_results_elements = driver.find_elements(By.XPATH, no_results_xpath)
+        if no_results_elements and page_num == 1:
+            logger.info(f"Nessun risultato trovato per '{target_name}' a '{comune_ricerca}'.")
+            break
 
         selected_selector = None
-        cards_count = 0
+        card_elements = []
 
         for selector in specific_card_selectors:
             found = driver.find_elements(By.XPATH, selector)
             if found:
                 selected_selector = selector
-                cards_count = len(found)
+                card_elements = found
                 break
 
-        if not selected_selector or cards_count == 0:
-            logger.error(f"Layout cambiato o nessun risultato trovato per {comune_ricerca} a pagina {page_num}.")
+        if not card_elements:
+            if page_num == 1 and not no_results_elements:
+                logger.error(f"Layout cambiato o selettori non validi per {comune_ricerca} a pagina {page_num}.")
+            else:
+                logger.info(f"Nessun'altra scheda trovata a pagina {page_num} per {comune_ricerca}.")
             break
 
-        extracted_on_page = 0
-        for i in range(cards_count):
+        page_contatti: list[Contatto] = []
+        for card_elem in card_elements:
             try:
-                data = extract_card_data(driver, i, selected_selector)
-                if data["Nome"]:
-                    contatto = Contatto(
-                        nome=data["Nome"],
-                        indirizzo=data["Indirizzo"],
-                        telefono=data["Telefono"],
-                        comune_ricerca=comune_ricerca
-                    )
-                    contatti.append(contatto)
-                    extracted_on_page += 1
+                contatto = extract_card_data(driver, card_elem, comune_ricerca)
+                if contatto:
+                    page_contatti.append(contatto)
             except Exception as e:
-                logger.error(f"Errore durante l'estrazione della scheda {i} per {comune_ricerca}: {e}", exc_info=True)
+                logger.error(f"Errore durante l'estrazione di una scheda per {comune_ricerca}: {e}", exc_info=True)
                 continue
 
-        logger.info(f"Estratte {extracted_on_page} persone da pagina {page_num}.")
+        logger.info(f"Estratte {len(page_contatti)} persone da pagina {page_num}.")
+        contatti.extend(page_contatti)
 
-        try:
-            cards = driver.find_elements(By.XPATH, selected_selector)
-            current_first_card_text = cards[0].text.strip() if cards else ""
-        except Exception:
-            current_first_card_text = ""
+        # Write per-page checkpoint CSV
+        append_checkpoint_csv(checkpoint_file, page_contatti)
 
+        # Pagination check
         next_button = None
         next_selectors = [
             "//a[contains(@class, 'pagination__next')]",
@@ -427,18 +481,25 @@ def scrape_results_for_municipality(driver: webdriver.Chrome, comune_ricerca: st
                 continue
 
         if next_button:
+            # Capture current first card text for page change verification
+            first_card_text_before = card_elements[0].text.strip() if card_elements else ""
             logger.info(f"Passaggio alla pagina successiva ({page_num + 1})...")
+
             try:
                 driver.execute_script("arguments[0].click();", next_button)
                 page_num += 1
-                random_delay(2.0, 3.5)
 
-                current_url = driver.current_url
-                if current_url == previous_url and current_first_card_text == previous_first_card_text:
-                    logger.info("Rilevato cambio pagina fallito (URL/contenuto immutato). Interruzione paginazione.")
+                # Wait for page content to update
+                try:
+                    WebDriverWait(driver, 10).until(
+                        lambda d: (
+                            len(d.find_elements(By.XPATH, selected_selector)) > 0 and
+                            d.find_elements(By.XPATH, selected_selector)[0].text.strip() != first_card_text_before
+                        )
+                    )
+                except TimeoutException:
+                    logger.info("Timeout in attesa dell'aggiornamento del contenuto della nuova pagina. Interruzione paginazione.")
                     break
-                previous_url = current_url
-                previous_first_card_text = current_first_card_text
 
             except Exception as e:
                 logger.error(f"Impossibile cliccare 'Pagina successiva': {e}", exc_info=True)
@@ -450,16 +511,15 @@ def scrape_results_for_municipality(driver: webdriver.Chrome, comune_ricerca: st
     if page_num > max_pages:
         logger.info(f"Raggiunto il limite massimo di pagine ({max_pages}) per {comune_ricerca}.")
 
-    save_checkpoint_csv(comune_ricerca, contatti)
     return contatti
 
 
-def deduplicate_contatti(contatti: List[Contatto]) -> List[Contatto]:
+def deduplicate_contatti(contatti: list[Contatto]) -> list[Contatto]:
     """
     Deduplicates contacts based on normalized (nome, indirizzo, telefono).
     """
-    seen: Set[Tuple[str, str, str]] = set()
-    unique_contatti: List[Contatto] = []
+    seen: set[tuple[str, str, str]] = set()
+    unique_contatti: list[Contatto] = []
     for c in contatti:
         key = c.get_dedup_key()
         if key not in seen:
@@ -471,16 +531,9 @@ def deduplicate_contatti(contatti: List[Contatto]) -> List[Contatto]:
     return unique_contatti
 
 
-def filtra_rpo(contatti: List[Contatto]) -> List[Contatto]:
+def filtra_rpo(contatti: list[Contatto]) -> list[Contatto]:
     """
     Stub di conformità per il filtraggio contro il Registro Pubblico delle Opposizioni (RPO).
-
-    I numeri di telefono destinati a contatti o campagne commerciali / telemarketing
-    devono essere obbligatoriamente verificati e filtrati rispetto al Registro Pubblico
-    delle Opposizioni (D.P.R. n. 26/2022) prima del loro utilizzo.
-
-    Attualmente la funzione restituisce tutti i contatti senza modifiche ed emette un
-    warning nei log di conformità.
     """
     logger.warning(
         "ATTENZIONE (Conformità RPO): I contatti non sono stati filtrati rispetto al "
@@ -490,18 +543,24 @@ def filtra_rpo(contatti: List[Contatto]) -> List[Contatto]:
     return contatti
 
 
-def save_to_excel(name: str, comuni_list: List[str], contatti: List[Contatto], output_filename: str = None) -> str:
+def save_to_excel(
+    name: str,
+    comuni_list: list[str],
+    contatti: list[Contatto],
+    output_dir: Path,
+    run_timestamp: str,
+    output_filename: str | None = None
+) -> str:
     """
     Exports collected Contatto objects to an Excel file with two sheets:
     - Sheet 'Riepilogo': Summary table of searched municipalities and counts.
     - Sheet 'Dati': Full dataset (Nome, Indirizzo, Telefono, Comune di Ricerca).
     """
     if not output_filename:
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         sanitized_name = re.sub(r'[^a-zA-Z0-9]', '_', name.strip().lower())
-        filename = f"ricerca_{sanitized_name}_{timestamp}.xlsx"
+        filename_path = output_dir / f"ricerca_{sanitized_name}_{run_timestamp}.xlsx"
     else:
-        filename = output_filename
+        filename_path = output_dir / output_filename
 
     summary_dict = {c: 0 for c in comuni_list}
     for c in contatti:
@@ -530,22 +589,26 @@ def save_to_excel(name: str, comuni_list: List[str], contatti: List[Contatto], o
     else:
         df_dati = pd.DataFrame(columns=["Nome", "Indirizzo", "Telefono", "Comune di Ricerca"])
 
-    with pd.ExcelWriter(filename, engine='openpyxl') as writer:
+    with pd.ExcelWriter(filename_path, engine='openpyxl') as writer:
         df_riepilogo.to_excel(writer, sheet_name='Riepilogo', index=False)
         df_dati.to_excel(writer, sheet_name='Dati', index=False)
 
-    logger.info(f"Esportazione completata con successo nel file: '{filename}'")
-    return filename
+    logger.info(f"Esportazione completata con successo nel file: '{filename_path}'")
+    return str(filename_path)
 
 
-def main():
+def main() -> None:
     args = parse_arguments()
     setup_logging(args.verbose)
 
     target_name, comuni_list = get_user_inputs(args)
 
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
     driver = None
-    all_extracted_contatti: List[Contatto] = []
+    all_extracted_contatti: list[Contatto] = []
 
     try:
         headless = not args.no_headless
@@ -554,12 +617,25 @@ def main():
         for comune in comuni_list:
             try:
                 search_municipality(driver, target_name, comune)
-                comune_results = scrape_results_for_municipality(driver, comune, max_pages=args.max_pages)
+                comune_results = scrape_results_for_municipality(
+                    driver=driver,
+                    target_name=target_name,
+                    comune_ricerca=comune,
+                    output_dir=output_dir,
+                    run_timestamp=run_timestamp,
+                    max_pages=args.max_pages
+                )
                 all_extracted_contatti.extend(comune_results)
+            except BotBlockedException:
+                logger.critical("Esecuzione interrotta per blocco anti-bot WAF/Captcha.")
+                sys.exit(1)
             except Exception as e:
                 logger.error(f"Errore durante l'elaborazione del comune '{comune}': {e}", exc_info=True)
                 continue
 
+    except BotBlockedException:
+        logger.critical("Esecuzione interrotta per blocco anti-bot WAF/Captcha.")
+        sys.exit(1)
     except Exception as e:
         logger.error(f"Si è verificato un errore critico durante l'esecuzione del browser: {e}", exc_info=True)
     finally:
@@ -568,7 +644,14 @@ def main():
 
     unique_contatti = deduplicate_contatti(all_extracted_contatti)
     filtered_contatti = filtra_rpo(unique_contatti)
-    save_to_excel(target_name, comuni_list, filtered_contatti, output_filename=args.output)
+    save_to_excel(
+        name=target_name,
+        comuni_list=comuni_list,
+        contatti=filtered_contatti,
+        output_dir=output_dir,
+        run_timestamp=run_timestamp,
+        output_filename=args.output
+    )
 
 
 if __name__ == "__main__":

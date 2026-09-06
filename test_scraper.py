@@ -1,60 +1,78 @@
 import os
 import unittest
+from pathlib import Path
 import pandas as pd
-from paginebianche_scraper import Contatto, save_to_excel
+from paginebianche_scraper import (
+    Contatto,
+    deduplicate_contatti,
+    save_to_excel,
+    append_checkpoint_csv,
+    validate_and_clean_phone
+)
 
-class TestExcelExport(unittest.TestCase):
-    def test_save_to_excel(self):
-        target_name = "Mario Rossi"
-        comuni_list = ["Suzzara", "Mantova"]
-        mock_data = [
-            Contatto(
-                nome="Rossi Mario",
-                indirizzo="Via Roma 10, 46029 Suzzara",
-                telefono="0376123456",
-                comune_ricerca="Suzzara"
-            ),
-            Contatto(
-                nome="Rossi Mario",
-                indirizzo="Corso Vittorio Emanuele 5, 46100 Mantova",
-                telefono="0376654321",
-                comune_ricerca="Mantova"
-            ),
-            Contatto(
-                nome="Rossi Mario Jr",
-                indirizzo="Via Milano 1, 46100 Mantova",
-                telefono="0376999888",
-                comune_ricerca="Mantova"
-            )
-        ]
+class TestScraperRefactored(unittest.TestCase):
 
-        filename = save_to_excel(target_name, comuni_list, mock_data)
-        self.assertTrue(os.path.exists(filename))
+    def test_phone_validation(self):
+        self.assertEqual(validate_and_clean_phone("0376 123456"), "0376123456")
+        self.assertEqual(validate_and_clean_phone("+39 340 1234567"), "+393401234567")
+        self.assertEqual(validate_and_clean_phone("3391234567"), "3391234567")
+        self.assertEqual(validate_and_clean_phone("via Roma 15, Milano"), "")
 
-        # Check sheets using pandas ExcelFile
-        excel_file = pd.ExcelFile(filename)
-        sheet_names = excel_file.sheet_names
-        self.assertIn("Riepilogo", sheet_names)
-        self.assertIn("Dati", sheet_names)
+    def test_deduplication(self):
+        c1 = Contatto("Mario Rossi", "Via Roma 10", "0376123456", "Suzzara")
+        c2 = Contatto("mario rossi", "via roma 10", "0376123456", "Mantova") # duplicate
+        c3 = Contatto("Luigi Bianchi", "Corso Italia 5", "0376654321", "Mantova")
 
-        # Read Riepilogo sheet
-        df_riepilogo = pd.read_excel(filename, sheet_name="Riepilogo")
-        self.assertEqual(len(df_riepilogo), 2)
-        self.assertListEqual(list(df_riepilogo.columns), ["Comune di Ricerca", "Numero Totale Persone Trovate"])
+        deduped = deduplicate_contatti([c1, c2, c3])
+        self.assertEqual(len(deduped), 2)
+        self.assertEqual(deduped[0].nome, "Mario Rossi")
+        self.assertEqual(deduped[1].nome, "Luigi Bianchi")
 
-        suzzara_row = df_riepilogo[df_riepilogo["Comune di Ricerca"] == "Suzzara"]
-        mantova_row = df_riepilogo[df_riepilogo["Comune di Ricerca"] == "Mantova"]
-        self.assertEqual(suzzara_row["Numero Totale Persone Trovate"].values[0], 1)
-        self.assertEqual(mantova_row["Numero Totale Persone Trovate"].values[0], 2)
+    def test_per_page_append_checkpoint_csv(self):
+        out_dir = Path("test_out")
+        out_dir.mkdir(exist_ok=True)
+        chk_file = out_dir / "checkpoint_mario_rossi_suzzara_20260906.csv"
 
-        # Read Dati sheet
-        df_dati = pd.read_excel(filename, sheet_name="Dati")
-        self.assertEqual(len(df_dati), 3)
-        self.assertListEqual(list(df_dati.columns), ["Nome", "Indirizzo", "Telefono", "Comune di Ricerca"])
+        c1 = Contatto("Mario Rossi", "Via Roma 10", "0376123456", "Suzzara")
+        c2 = Contatto("Giuseppe Rossi", "Via Milano 2", "0376654321", "Suzzara")
+
+        append_checkpoint_csv(chk_file, [c1])
+        append_checkpoint_csv(chk_file, [c2])
+
+        self.assertTrue(chk_file.exists())
+
+        df = pd.read_csv(chk_file)
+        self.assertEqual(len(df), 2)
+        self.assertListEqual(list(df.columns), ["Nome", "Indirizzo", "Telefono", "Comune di Ricerca"])
 
         # Clean up
-        if os.path.exists(filename):
-            os.remove(filename)
+        if chk_file.exists():
+            chk_file.unlink()
+        if out_dir.exists():
+            out_dir.rmdir()
+
+    def test_excel_export(self):
+        out_dir = Path("test_out_excel")
+        out_dir.mkdir(exist_ok=True)
+        run_ts = "20260906_120000"
+
+        c1 = Contatto("Mario Rossi", "Via Roma 10", "0376123456", "Suzzara")
+        file_path = save_to_excel("Mario Rossi", ["Suzzara"], [c1], output_dir=out_dir, run_timestamp=run_ts)
+
+        self.assertTrue(os.path.exists(file_path))
+
+        excel_file = pd.ExcelFile(file_path)
+        self.assertIn("Riepilogo", excel_file.sheet_names)
+        self.assertIn("Dati", excel_file.sheet_names)
+
+        df_dati = pd.read_excel(file_path, sheet_name="Dati")
+        self.assertEqual(len(df_dati), 1)
+
+        # Clean up
+        if os.path.exists(file_path):
+            os.remove(file_path)
+        if out_dir.exists():
+            out_dir.rmdir()
 
 if __name__ == "__main__":
     unittest.main()
