@@ -1,31 +1,31 @@
 import os
 import unittest
 import pandas as pd
-from paginebianche_scraper import save_to_excel
+from paginebianche_scraper import Contatto, save_to_excel
 
 class TestExcelExport(unittest.TestCase):
     def test_save_to_excel(self):
         target_name = "Mario Rossi"
         comuni_list = ["Suzzara", "Mantova"]
         mock_data = [
-            {
-                "Nome": "Rossi Mario",
-                "Indirizzo": "Via Roma 10, 46029 Suzzara",
-                "Telefono": "0376 123456",
-                "Comune di Ricerca": "Suzzara"
-            },
-            {
-                "Nome": "Rossi Mario",
-                "Indirizzo": "Corso Vittorio Emanuele 5, 46100 Mantova",
-                "Telefono": "0376 654321",
-                "Comune di Ricerca": "Mantova"
-            },
-            {
-                "Nome": "Rossi Mario Jr",
-                "Indirizzo": "Via Milano 1, 46100 Mantova",
-                "Telefono": "0376 999888",
-                "Comune di Ricerca": "Mantova"
-            }
+            Contatto(
+                nome="Rossi Mario",
+                indirizzo="Via Roma 10, 46029 Suzzara",
+                telefono="0376123456",
+                comune_ricerca="Suzzara"
+            ),
+            Contatto(
+                nome="Rossi Mario",
+                indirizzo="Corso Vittorio Emanuele 5, 46100 Mantova",
+                telefono="0376654321",
+                comune_ricerca="Mantova"
+            ),
+            Contatto(
+                nome="Rossi Mario Jr",
+                indirizzo="Via Milano 1, 46100 Mantova",
+                telefono="0376999888",
+                comune_ricerca="Mantova"
+            )
         ]
 
         filename = save_to_excel(target_name, comuni_list, mock_data)
