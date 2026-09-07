@@ -197,14 +197,14 @@ def accept_cookies(driver: webdriver.Chrome, timeout: int = 3) -> bool:
 
 def search_municipality(driver: webdriver.Chrome, name: str, comune: str) -> None:
     """
-    Navigates to Pagine Bianche search page for the given name and municipality
-    and waits for results container or no-results element.
+    Navigates to Pagine Bianche search page for personal contacts (persone)
+    for the given name and municipality and waits for results or no-results container.
     """
     encoded_name = urllib.parse.quote(name)
     encoded_comune = urllib.parse.quote(comune)
-    url = f"https://www.paginebianche.it/cerca?qs={encoded_name}&dv={encoded_comune}"
+    url = f"https://www.paginebianche.it/persone?qs={encoded_name}&dv={encoded_comune}"
 
-    logger.info(f"Ricerca per '{name}' a '{comune}' -> {url}")
+    logger.info(f"Ricerca persone per '{name}' a '{comune}' -> {url}")
     driver.get(url)
 
     check_for_bot_block(driver)
@@ -215,9 +215,11 @@ def search_municipality(driver: webdriver.Chrome, name: str, comune: str) -> Non
         "contains(@class, 'item-listing') or "
         "contains(@class, 'search-itm') or "
         "contains(@class, 'no-results') or "
-        "contains(@class, 'no-result') or "
-        "//*[contains(text(), 'Nessun risultato')] or "
-        "//*[contains(text(), 'non ha prodotto risultati')]]"
+        "contains(@class, 'no-result')] | "
+        "//*[contains(text(), 'Spiacenti') or "
+        "contains(text(), 'non siamo riusciti') or "
+        "contains(text(), 'Nessun risultato') or "
+        "contains(text(), 'non ha prodotto risultati')]"
     )
     try:
         WebDriverWait(driver, 10).until(
@@ -411,8 +413,10 @@ def scrape_results_for_municipality(
 
     no_results_xpath = (
         "//div[contains(@class, 'no-results') or contains(@class, 'no-result')] | "
-        "//*[contains(text(), 'Nessun risultato')] | "
-        "//*[contains(text(), 'non ha prodotto risultati')]"
+        "//*[contains(text(), 'Spiacenti') or "
+        "contains(text(), 'non siamo riusciti') or "
+        "contains(text(), 'Nessun risultato') or "
+        "contains(text(), 'non ha prodotto risultati')]"
     )
 
     while page_num <= max_pages:
@@ -422,7 +426,11 @@ def scrape_results_for_municipality(
 
         # Check explicit no-results elements first
         no_results_elements = driver.find_elements(By.XPATH, no_results_xpath)
-        if no_results_elements and page_num == 1:
+        has_no_results = any(
+            any(phrase in elem.text.lower() for phrase in ["spiacenti", "non siamo riusciti", "nessun risultato", "non ha prodotto"])
+            for elem in no_results_elements
+        )
+        if has_no_results and page_num == 1:
             logger.info(f"Nessun risultato trovato per '{target_name}' a '{comune_ricerca}'.")
             break
 
@@ -437,7 +445,7 @@ def scrape_results_for_municipality(
                 break
 
         if not card_elements:
-            if page_num == 1 and not no_results_elements:
+            if page_num == 1 and not has_no_results:
                 logger.error(f"Layout cambiato o selettori non validi per {comune_ricerca} a pagina {page_num}.")
             else:
                 logger.info(f"Nessun'altra scheda trovata a pagina {page_num} per {comune_ricerca}.")
@@ -481,7 +489,6 @@ def scrape_results_for_municipality(
                 continue
 
         if next_button:
-            # Capture current first card text for page change verification
             first_card_text_before = card_elements[0].text.strip() if card_elements else ""
             logger.info(f"Passaggio alla pagina successiva ({page_num + 1})...")
 
@@ -489,7 +496,6 @@ def scrape_results_for_municipality(
                 driver.execute_script("arguments[0].click();", next_button)
                 page_num += 1
 
-                # Wait for page content to update
                 try:
                     WebDriverWait(driver, 10).until(
                         lambda d: (
