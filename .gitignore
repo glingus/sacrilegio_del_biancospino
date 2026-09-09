@@ -1,0 +1,15 @@
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+
+# Virtual environments
+.venv/
+venv/
+
+# Run output: Excel exports and per-page checkpoints are produced by each run
+*.xlsx
+checkpoint_*.csv
+
+# Test scratch directories
+test_out/
+test_out_excel/
