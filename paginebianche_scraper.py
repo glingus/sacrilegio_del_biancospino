@@ -39,6 +39,59 @@ logger = logging.getLogger("paginebianche_scraper")
 MAX_PAGES_DEFAULT = 20
 PHONE_REGEX = re.compile(r'^(?:\+?39)?(?:0\d{5,10}|3\d{8,9})$')
 
+# Search endpoint. The site advertises it in its own JSON-LD SearchAction as
+# https://www.paginebianche.it/ricerca?qs={search_term_string}; 'qs' (chi) and
+# 'dv' (dove) are the input names used by the homepage search form.
+SEARCH_BASE_URL = "https://www.paginebianche.it/ricerca"
+
+# Phrases the site uses to announce an empty result set. Single source of truth:
+# both the XPath predicates and the Python text check are derived from this tuple.
+NO_RESULTS_PHRASES = (
+    "spiacenti",
+    "non siamo riusciti",
+    "nessun risultato",
+    "non ha prodotto",
+)
+
+# Structural marker of an empty result set: its presence is conclusive on its own,
+# whatever copy the site puts inside it.
+NO_RESULTS_CONTAINER_XPATH = (
+    "//div[contains(@class, 'no-results') or contains(@class, 'no-result')]"
+)
+
+RESULT_CARD_SELECTORS = (
+    "//div[contains(@class, 'search-item')]",
+    "//div[contains(@class, 'item-listing')]",
+    "//div[contains(@class, 'search-itm')]",
+)
+
+BOT_BLOCK_TITLE_INDICATORS = (
+    "captcha",
+    "challenge",
+    "verifica la tua identità",
+    "access denied",
+    "robot",
+)
+WAF_MARKER_XPATH = "//*[contains(@id, 'awswaf') or contains(@class, 'awswaf')]"
+
+# XPath 1.0 has no lower-case(); translate() is the portable way to fold case.
+_XPATH_UPPER = "ABCDEFGHIJKLMNOPQRSTUVWXYZÀÈÉÌÒÙ"
+_XPATH_LOWER = "abcdefghijklmnopqrstuvwxyzàèéìòù"
+
+
+def _build_no_results_text_xpath() -> str:
+    """
+    Builds the case-insensitive XPath matching any NO_RESULTS_PHRASES in node text.
+    """
+    conditions = " or ".join(
+        f"contains(translate(text(), '{_XPATH_UPPER}', '{_XPATH_LOWER}'), '{phrase}')"
+        for phrase in NO_RESULTS_PHRASES
+    )
+    return f"//*[{conditions}]"
+
+
+NO_RESULTS_TEXT_XPATH = _build_no_results_text_xpath()
+
 
 class BotBlockedException(Exception):
     """Exception raised when an anti-bot challenge or WAF block is detected."""
@@ -60,6 +113,18 @@ class Contatto:
         norm_indirizzo = re.sub(r'\s+', ' ', self.indirizzo.strip().lower())
         norm_telefono = re.sub(r'[^\d+]', '', self.telefono.strip())
         return (norm_nome, norm_indirizzo, norm_telefono)
+
+
+@dataclass
+class RisultatoComune:
+    """
+    Outcome of scraping one municipality: the contacts plus why the run may be
+    incomplete, so main() can set a non-zero exit status instead of reporting
+    an empty scrape as a success.
+    """
+    contatti: list[Contatto]
+    layout_error: bool = False
+    truncated: bool = False
 
 
 def setup_logging(verbose: bool = False) -> None:
@@ -93,6 +158,7 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--output", type=str, help="Nome del file di output (opzionale)")
     parser.add_argument("--output-dir", type=str, default=".", help="Directory di destinazione per file Excel e checkpoint")
     parser.add_argument("--max-pages", type=int, default=MAX_PAGES_DEFAULT, help="Numero massimo di pagine per comune (default: 20)")
+    parser.add_argument("--search-url", type=str, default=SEARCH_BASE_URL, help=f"Endpoint di ricerca da interrogare (default: {SEARCH_BASE_URL})")
     parser.add_argument("--no-headless", action="store_true", help="Esegui il browser in modalità visibile (non headless)")
     parser.add_argument("--verbose", action="store_true", help="Abilita log dettagliati (DEBUG)")
     return parser.parse_args()
@@ -156,10 +222,14 @@ def check_for_bot_block(driver: webdriver.Chrome) -> None:
     Raises BotBlockedException if a block is detected.
     """
     title = driver.title.lower()
-    page_source = driver.page_source.lower()
 
-    block_indicators = ["captcha", "challenge", "verifica la tua identità", "access denied", "robot"]
-    if any(ind in title for ind in block_indicators) or "awswafintegration" in page_source:
+    # Targeted queries only: this runs on every page of every municipality, and
+    # serializing the whole DOM to test for one substring costs ~0.5MB a call.
+    blocked = any(ind in title for ind in BOT_BLOCK_TITLE_INDICATORS)
+    if not blocked:
+        blocked = bool(driver.find_elements(By.XPATH, WAF_MARKER_XPATH))
+
+    if blocked:
         logger.critical(f"Rilevato blocco anti-bot / WAF / Captcha (Titolo pagina: '{driver.title}'). Interruzione run.")
         raise BotBlockedException(f"Blocco anti-bot rilevato: {driver.title}")
 
@@ -195,14 +265,75 @@ def accept_cookies(driver: webdriver.Chrome, timeout: int = 3) -> bool:
     return False
 
 
-def search_municipality(driver: webdriver.Chrome, name: str, comune: str) -> None:
+def build_search_url(name: str, comune: str, base_url: str = SEARCH_BASE_URL) -> str:
+    """
+    Builds the Pagine Bianche people-search URL for a name and municipality.
+    """
+    encoded_name = urllib.parse.quote(name)
+    encoded_comune = urllib.parse.quote(comune)
+    return f"{base_url}?qs={encoded_name}&dv={encoded_comune}"
+
+
+def element_is_stale(element) -> bool:
+    """
+    Returns True if the WebElement no longer refers to a node in the live DOM.
+    """
+    try:
+        element.is_enabled()
+        return False
+    except StaleElementReferenceException:
+        return True
+
+
+def find_result_cards(driver: webdriver.Chrome) -> list:
+    """
+    Returns the result cards found by the first matching selector, or an empty list.
+    """
+    for selector in RESULT_CARD_SELECTORS:
+        found = driver.find_elements(By.XPATH, selector)
+        if found:
+            logger.debug(f"Schede individuate con il selettore '{selector}' ({len(found)} elementi).")
+            return found
+    return []
+
+
+def page_reports_no_results(driver: webdriver.Chrome) -> bool:
+    """
+    Returns True if the current page states it has no results.
+
+    A dedicated no-results container is conclusive on its own, whatever copy it
+    holds; a bare text node has to actually render one of NO_RESULTS_PHRASES,
+    so hidden i18n bundles and templates do not count as an answer.
+    Used by both the load wait and the scrape loop so the two cannot disagree.
+    """
+    try:
+        if driver.find_elements(By.XPATH, NO_RESULTS_CONTAINER_XPATH):
+            return True
+
+        for elem in driver.find_elements(By.XPATH, NO_RESULTS_TEXT_XPATH):
+            try:
+                text = elem.text.lower()
+            except StaleElementReferenceException:
+                continue
+            if any(phrase in text for phrase in NO_RESULTS_PHRASES):
+                return True
+    except StaleElementReferenceException:
+        logger.debug("Stale element durante il controllo dei marcatori 'nessun risultato'.")
+
+    return False
+
+
+def search_municipality(
+    driver: webdriver.Chrome,
+    name: str,
+    comune: str,
+    base_url: str = SEARCH_BASE_URL
+) -> None:
     """
     Navigates to Pagine Bianche search page for personal contacts (persone)
     for the given name and municipality and waits for results or no-results container.
     """
-    encoded_name = urllib.parse.quote(name)
-    encoded_comune = urllib.parse.quote(comune)
-    url = f"https://www.paginebianche.it/persone?qs={encoded_name}&dv={encoded_comune}"
+    url = build_search_url(name, comune, base_url)
 
     logger.info(f"Ricerca persone per '{name}' a '{comune}' -> {url}")
     driver.get(url)
@@ -210,23 +341,15 @@ def search_municipality(driver: webdriver.Chrome, name: str, comune: str) -> Non
     check_for_bot_block(driver)
     accept_cookies(driver)
 
-    results_or_no_results_xpath = (
-        "//div[contains(@class, 'search-item') or "
-        "contains(@class, 'item-listing') or "
-        "contains(@class, 'search-itm') or "
-        "contains(@class, 'no-results') or "
-        "contains(@class, 'no-result')] | "
-        "//*[contains(text(), 'Spiacenti') or "
-        "contains(text(), 'non siamo riusciti') or "
-        "contains(text(), 'Nessun risultato') or "
-        "contains(text(), 'non ha prodotto risultati')]"
-    )
     try:
         WebDriverWait(driver, 10).until(
-            EC.presence_of_element_located((By.XPATH, results_or_no_results_xpath))
+            lambda d: bool(find_result_cards(d)) or page_reports_no_results(d)
         )
     except TimeoutException:
-        logger.error("Timeout in attesa del caricamento dei risultati della ricerca.")
+        logger.error(
+            f"Timeout in attesa del caricamento dei risultati della ricerca "
+            f"(URL: {driver.current_url})."
+        )
 
 
 def validate_and_clean_phone(raw_phone: str) -> str:
@@ -392,11 +515,12 @@ def scrape_results_for_municipality(
     output_dir: Path,
     run_timestamp: str,
     max_pages: int = MAX_PAGES_DEFAULT
-) -> list[Contatto]:
+) -> RisultatoComune:
     """
     Scrapes all pages of search results for a single municipality.
     Appends checkpoint CSV per page.
-    Distinguishes no-results (INFO) from broken layout (ERROR).
+    Distinguishes no-results (INFO) from broken layout (ERROR), and reports both
+    that distinction and any early truncation back to the caller.
     """
     sanitized_name = re.sub(r'[^a-zA-Z0-9]', '_', target_name.strip().lower())
     sanitized_comune = re.sub(r'[^a-zA-Z0-9]', '_', comune_ricerca.strip().lower())
@@ -404,51 +528,30 @@ def scrape_results_for_municipality(
 
     contatti: list[Contatto] = []
     page_num = 1
-
-    specific_card_selectors = [
-        "//div[contains(@class, 'search-item')]",
-        "//div[contains(@class, 'item-listing')]",
-        "//div[contains(@class, 'search-itm')]"
-    ]
-
-    no_results_xpath = (
-        "//div[contains(@class, 'no-results') or contains(@class, 'no-result')] | "
-        "//*[contains(text(), 'Spiacenti') or "
-        "contains(text(), 'non siamo riusciti') or "
-        "contains(text(), 'Nessun risultato') or "
-        "contains(text(), 'non ha prodotto risultati')]"
-    )
+    layout_error = False
+    truncated = False
 
     while page_num <= max_pages:
         logger.info(f"Estrazione pagina {page_num}/{max_pages} per comune: {comune_ricerca}...")
         random_delay(1.0, 2.0)
         check_for_bot_block(driver)
 
-        # Check explicit no-results elements first
-        no_results_elements = driver.find_elements(By.XPATH, no_results_xpath)
-        has_no_results = any(
-            any(phrase in elem.text.lower() for phrase in ["spiacenti", "non siamo riusciti", "nessun risultato", "non ha prodotto"])
-            for elem in no_results_elements
-        )
-        if has_no_results and page_num == 1:
-            logger.info(f"Nessun risultato trovato per '{target_name}' a '{comune_ricerca}'.")
-            break
-
-        selected_selector = None
-        card_elements = []
-
-        for selector in specific_card_selectors:
-            found = driver.find_elements(By.XPATH, selector)
-            if found:
-                selected_selector = selector
-                card_elements = found
-                break
+        # Look for result cards first: a page carrying extractable cards is a
+        # results page even when some widget on it mentions "nessun risultato".
+        card_elements = find_result_cards(driver)
 
         if not card_elements:
-            if page_num == 1 and not has_no_results:
-                logger.error(f"Layout cambiato o selettori non validi per {comune_ricerca} a pagina {page_num}.")
-            else:
+            if page_num > 1:
                 logger.info(f"Nessun'altra scheda trovata a pagina {page_num} per {comune_ricerca}.")
+            elif page_reports_no_results(driver):
+                logger.info(f"Nessun risultato trovato per '{target_name}' a '{comune_ricerca}'.")
+            else:
+                layout_error = True
+                logger.error(
+                    f"Nessuna scheda e nessun messaggio di ricerca vuota per {comune_ricerca}: "
+                    f"layout cambiato, selettori non validi o endpoint di ricerca errato "
+                    f"(URL: {driver.current_url})."
+                )
             break
 
         page_contatti: list[Contatto] = []
@@ -489,7 +592,8 @@ def scrape_results_for_municipality(
                 continue
 
         if next_button:
-            first_card_text_before = card_elements[0].text.strip() if card_elements else ""
+            url_before = driver.current_url
+            first_card_before = card_elements[0]
             logger.info(f"Passaggio alla pagina successiva ({page_num + 1})...")
 
             try:
@@ -497,17 +601,24 @@ def scrape_results_for_municipality(
                 page_num += 1
 
                 try:
+                    # Key on DOM/URL identity rather than on the first card's text:
+                    # consecutive pages can legitimately open with an identical entry.
                     WebDriverWait(driver, 10).until(
-                        lambda d: (
-                            len(d.find_elements(By.XPATH, selected_selector)) > 0 and
-                            d.find_elements(By.XPATH, selected_selector)[0].text.strip() != first_card_text_before
-                        )
+                        lambda d: d.current_url != url_before or element_is_stale(first_card_before)
+                    )
+                    WebDriverWait(driver, 10).until(
+                        lambda d: bool(find_result_cards(d)) or page_reports_no_results(d)
                     )
                 except TimeoutException:
-                    logger.info("Timeout in attesa dell'aggiornamento del contenuto della nuova pagina. Interruzione paginazione.")
+                    truncated = True
+                    logger.warning(
+                        f"Timeout in attesa della pagina {page_num} per {comune_ricerca}: "
+                        f"paginazione interrotta, risultati potenzialmente incompleti."
+                    )
                     break
 
             except Exception as e:
+                truncated = True
                 logger.error(f"Impossibile cliccare 'Pagina successiva': {e}", exc_info=True)
                 break
         else:
@@ -517,7 +628,7 @@ def scrape_results_for_municipality(
     if page_num > max_pages:
         logger.info(f"Raggiunto il limite massimo di pagine ({max_pages}) per {comune_ricerca}.")
 
-    return contatti
+    return RisultatoComune(contatti=contatti, layout_error=layout_error, truncated=truncated)
 
 
 def deduplicate_contatti(contatti: list[Contatto]) -> list[Contatto]:
@@ -599,7 +710,13 @@ def save_to_excel(
         df_riepilogo.to_excel(writer, sheet_name='Riepilogo', index=False)
         df_dati.to_excel(writer, sheet_name='Dati', index=False)
 
-    logger.info(f"Esportazione completata con successo nel file: '{filename_path}'")
+    if contatti:
+        logger.info(f"Esportazione completata con successo nel file: '{filename_path}'")
+    else:
+        logger.warning(
+            f"Esportazione completata SENZA alcun contatto: '{filename_path}' contiene "
+            f"solo un riepilogo a zero."
+        )
     return str(filename_path)
 
 
@@ -615,6 +732,9 @@ def main() -> None:
 
     driver = None
     all_extracted_contatti: list[Contatto] = []
+    comuni_falliti: list[str] = []
+    comuni_troncati: list[str] = []
+    errore_critico = False
 
     try:
         headless = not args.no_headless
@@ -622,8 +742,8 @@ def main() -> None:
 
         for comune in comuni_list:
             try:
-                search_municipality(driver, target_name, comune)
-                comune_results = scrape_results_for_municipality(
+                search_municipality(driver, target_name, comune, base_url=args.search_url)
+                esito = scrape_results_for_municipality(
                     driver=driver,
                     target_name=target_name,
                     comune_ricerca=comune,
@@ -631,12 +751,17 @@ def main() -> None:
                     run_timestamp=run_timestamp,
                     max_pages=args.max_pages
                 )
-                all_extracted_contatti.extend(comune_results)
+                all_extracted_contatti.extend(esito.contatti)
+                if esito.layout_error:
+                    comuni_falliti.append(comune)
+                if esito.truncated:
+                    comuni_troncati.append(comune)
             except BotBlockedException:
                 logger.critical("Esecuzione interrotta per blocco anti-bot WAF/Captcha.")
                 sys.exit(1)
             except Exception as e:
                 logger.error(f"Errore durante l'elaborazione del comune '{comune}': {e}", exc_info=True)
+                comuni_falliti.append(comune)
                 continue
 
     except BotBlockedException:
@@ -644,6 +769,7 @@ def main() -> None:
         sys.exit(1)
     except Exception as e:
         logger.error(f"Si è verificato un errore critico durante l'esecuzione del browser: {e}", exc_info=True)
+        errore_critico = True
     finally:
         if driver:
             driver.quit()
@@ -658,6 +784,22 @@ def main() -> None:
         run_timestamp=run_timestamp,
         output_filename=args.output
     )
+
+    if comuni_troncati:
+        logger.warning(
+            f"Paginazione interrotta prima della fine per {len(comuni_troncati)} comune/i "
+            f"({', '.join(comuni_troncati)}): i dati esportati per questi comuni sono parziali."
+        )
+
+    if comuni_falliti:
+        logger.error(
+            f"Run terminato con errori su {len(comuni_falliti)} comune/i "
+            f"({', '.join(comuni_falliti)}): il file esportato è incompleto. "
+            f"Verificare l'endpoint di ricerca (--search-url) e i selettori delle schede."
+        )
+
+    if comuni_falliti or errore_critico:
+        sys.exit(2)
 
 
 if __name__ == "__main__":
